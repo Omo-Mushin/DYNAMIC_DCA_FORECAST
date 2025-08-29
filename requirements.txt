@@ -1,5 +1,706 @@
-streamlit
-pandas
-numpy
-matplotlib
-openpyxl
+# streamlit_forecast_multi_fluid_fixed_gas.py
+import streamlit as st
+import pandas as pd
+import numpy as np
+import io
+from datetime import datetime
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+st.set_page_config(layout="wide", page_title="Well Production Forecast (Multi-Fluid)")
+st.title("Well Production Forecast — Oil, Gas, Condensate, Water")
+
+# ---------------- Helpers ----------------
+def classify_field(well_name):
+    name = str(well_name).upper()
+    if "AWOBA NW" in name: return "Awoba NW"
+    if "AWOBA" in name: return "Awoba"
+    if "EKULAMA" in name: return "Ekulama"
+    return "Other"
+
+def safe_float(x, default=0.0):
+    try:
+        if pd.isna(x):
+            return float(default)
+        return float(x)
+    except Exception:
+        return float(default)
+
+def weighted_avg(values, weights):
+    ws = weights.sum()
+    if ws > 0:
+        return (values * weights).sum() / ws
+    return values.mean() if len(values) else np.nan
+
+def pivot_report(df_summary, index_col, pivot_col, value_col):
+    if df_summary.empty:
+        return pd.DataFrame()
+    piv = df_summary.pivot(index=index_col, columns=pivot_col, values=value_col).fillna(0)
+    piv = piv.reset_index()
+    return piv
+
+# ---------------- Forecast generator (AG from oil via GOR; NAG independent; Condensate from NAG via CGR) ----------------
+def generate_forecasts(df, start_year=2025, end_year=2030, default_decline_rate=5):
+    df = df.copy()
+    df.columns = df.columns.str.strip()
+
+    if 'Well Name' not in df.columns:
+        raise KeyError("Input Excel must contain a 'Well Name' column")
+
+    # Normalize and detect possible gas/GOR/CGR column names
+    # Primary expectations:
+    #   - G0R or GOR: scf/bbl (will convert to MMscf/bbl by /1e6)
+    #   - "Gas Rate (MMscfd)" or "Gas Rate (MMscfd) (NAG)" : NAG in MMscfd
+    #   - CGR: bbl / MMscf (condensate per MMscf of NAG)
+    df['Start Date'] = pd.to_datetime(df.get('Forecast_Start_Test'), errors='coerce', dayfirst=False)
+    df['Field'] = df['Well Name'].apply(classify_field)
+    dates = pd.date_range(f"{int(start_year)}-01-01", f"{int(end_year)}-12-31", freq='MS')
+
+    rows = []
+    # determine gas column name gracefully
+    gas_col_candidates = ['Gas Rate (MMscfd)', 'Gas Rate (MMscfd) (NAG)', 'Gas Rate', 'Gas_Rate']
+    gor_candidates = ['G0R', 'GOR', 'G0R (scf/bbl)', 'GOR (scf/bbl)']
+    cgr_candidates = ['CGR', 'Condensate Gas Ratio', 'CGR (bbl/MMscf)']
+
+    # find actual columns present
+    gas_col = next((c for c in gas_col_candidates if c in df.columns), None)
+    gor_col = next((c for c in gor_candidates if c in df.columns), None)
+    cgr_col = next((c for c in cgr_candidates if c in df.columns), None)
+
+    for _, well in df.iterrows():
+        start_date = well['Start Date']
+        if pd.isna(start_date):
+            continue
+
+        decline_raw = well.get('Decline exponent(/year)', well.get('Decline exponent(/year) ', default_decline_rate))
+        try:
+            decline_rate = float(decline_raw) / 100.0
+        except Exception:
+            decline_rate = float(default_decline_rate) / 100.0
+        monthly_decline_default = decline_rate / 12.0
+
+        abandonment = safe_float(well.get('ABANDONMENT RATE (B0PD)', 0))
+        wor0 = safe_float(well.get('WOR', 0))
+        wor_growth = safe_float(well.get('WATER_GROWTH_RATE', 0)) / 100.0
+
+        pdays_raw = well.get('PRODDAYS', 30.4)
+        try:
+            pdays = float(pdays_raw) if not pd.isna(pdays_raw) else 30.4
+        except Exception:
+            pdays = 30.4
+
+        first_prod_month = start_date + pd.DateOffset(months=1)
+        months_since = [(d - first_prod_month).days // 30 for d in dates]
+
+        plateau_raw = well.get('Plateau Period (months)', 0)
+        try:
+            plateau_months = int(plateau_raw) if not pd.isna(plateau_raw) else 0
+        except Exception:
+            plateau_months = 0
+
+        # daily oil rate (bopd)
+        oil_rate = safe_float(well.get('Oil Rate (bopd)', 0))
+
+        # GOR: expected scf/bbl -> convert to MMscf/bbl (divide by 1e6)
+        gor_scf_per_bbl = safe_float(well.get(gor_col, 0)) if gor_col else 0.0
+        gor_mmscfd_per_bbl = gor_scf_per_bbl / 1_000_000.0
+
+        # NAG gas rate (MMscfd) - if missing default 0
+        gas_rate_nag = safe_float(well.get(gas_col, 0)) if gas_col else 0.0
+
+        # CGR assumed bbl / MMscf (condensate per MMscf of NAG)
+        cgr_bbl_per_mmscfd = safe_float(well.get(cgr_col, 0)) if cgr_col else 0.0
+
+        # Optional distinct decline rates for oil/gas
+        decline_rate_oil = safe_float(well.get('Decline exponent(/year) Oil', decline_rate*100)) / 100.0
+        decline_rate_gas = safe_float(well.get('Decline exponent(/year) Gas', decline_rate*100)) / 100.0
+        monthly_decline_oil = decline_rate_oil / 12.0
+        monthly_decline_gas = decline_rate_gas / 12.0
+
+        def_factor_oil = safe_float(well.get('DEFERMENT_FACTOR(OIL)', 1.0), 1.0)
+        def_factor_gas = safe_float(well.get('DEFERMENT_FACTOR(GAS)', 1.0), 1.0)
+
+        n = len(dates)
+        oil = np.zeros(n)
+        gas_ag = np.zeros(n)    # associated gas from oil via GOR
+        gas_nag = np.zeros(n)   # non-associated gas from gas column
+        gas_total = np.zeros(n)
+        cond = np.zeros(n)      # condensate bbl/d from NAG only (CGR * NAG)
+        water = np.zeros(n)
+        wor = np.zeros(n)
+
+        ms = np.array(months_since)
+        producing = ms >= 0
+        in_plateau = producing & (ms < plateau_months)
+        in_decline = ms >= plateau_months
+
+        # Plateau
+        oil[in_plateau] = oil_rate
+        gas_ag[in_plateau] = gor_mmscfd_per_bbl * oil[in_plateau]   # AG derived from oil * GOR
+        gas_nag[in_plateau] = gas_rate_nag
+        gas_total[in_plateau] = gas_ag[in_plateau] + gas_nag[in_plateau]
+        cond[in_plateau] = cgr_bbl_per_mmscfd * gas_nag[in_plateau] # condensate from NAG only
+        wor[in_plateau] = wor0
+        water[in_plateau] = oil[in_plateau] * wor[in_plateau]
+
+        # Decline
+        if in_decline.any():
+            decline_months = ms[in_decline] - plateau_months
+            oil_declined = oil_rate * np.exp(-monthly_decline_oil * decline_months) * def_factor_oil
+            oil_declined = np.maximum(oil_declined, abandonment)
+            gas_ag_declined = gor_mmscfd_per_bbl * oil_declined * def_factor_gas
+            gas_nag_declined = gas_rate_nag * np.exp(-monthly_decline_gas * decline_months) * def_factor_gas
+            gas_total_declined = gas_ag_declined + gas_nag_declined
+            cond_declined = cgr_bbl_per_mmscfd * gas_nag_declined
+            oil[in_decline] = oil_declined
+            gas_ag[in_decline] = gas_ag_declined
+            gas_nag[in_decline] = gas_nag_declined
+            gas_total[in_decline] = gas_total_declined
+            cond[in_decline] = cond_declined
+            wor[in_decline] = wor0 * np.exp(wor_growth * decline_months)
+            water[in_decline] = oil[in_decline] * wor[in_decline]
+
+        # Convert daily rates to monthly volumes
+        monthly_oil_bbl = oil * pdays
+        monthly_gas_ag_mmscf = gas_ag * pdays
+        monthly_gas_nag_mmscf = gas_nag * pdays
+        monthly_gas_total_mmscf = gas_total * pdays
+        monthly_cond_bbl = cond * pdays
+        monthly_water_bbl = water * pdays
+
+        cum_oil = np.cumsum(monthly_oil_bbl)
+        cum_gas_total = np.cumsum(monthly_gas_total_mmscf)
+        cum_cond = np.cumsum(monthly_cond_bbl)
+        cum_water = np.cumsum(monthly_water_bbl)
+
+        for i, dt in enumerate(dates):
+            rows.append({
+                'Date': dt,
+                'Month': dt.strftime('%Y-%m'),
+                'Year': dt.year,
+                'Well Name': well['Well Name'],
+                'Field': well['Field'],
+                'Flowstation': well.get('Flowstation', ''),
+                'Tag': well.get('Description', ''),
+                'Oil (bopd)': oil[i],
+                'Gas_AG (MMscfd)': gas_ag[i],
+                'Gas_NAG (MMscfd)': gas_nag[i],
+                'Gas (MMscfd)': gas_total[i],
+                'Condensate (bbl/d) (from NAG)': cond[i],
+                'Water (bwpd)': water[i],
+                'PRODDAYS': pdays,
+                'Monthly Oil (bbl)': monthly_oil_bbl[i],
+                'Monthly Gas AG (MMscf)': monthly_gas_ag_mmscf[i],
+                'Monthly Gas NAG (MMscf)': monthly_gas_nag_mmscf[i],
+                'Monthly Gas (MMscf)': monthly_gas_total_mmscf[i],
+                'Monthly Condensate (bbl)': monthly_cond_bbl[i],
+                'Monthly Water (bbl)': monthly_water_bbl[i],
+                'Cumulative Oil (bbl)': cum_oil[i],
+                'Cumulative Gas (MMscf)': cum_gas_total[i],
+                'Cumulative Condensate (bbl)': cum_cond[i],
+                'Cumulative Water (bbl)': cum_water[i],
+                'Status': 'Future' if dt < first_prod_month else 'Producing',
+                'Decline Rate Used': decline_rate,
+                'Abandonment Rate Applied': abandonment
+            })
+
+    if len(rows) == 0:
+        return {'well_forecast': pd.DataFrame()}
+
+    wf = pd.DataFrame(rows)
+
+    # Monthly/yearly summaries (include totals & averages for each fluid)
+    monthly_well = (wf.groupby(['Month', 'Well Name'])
+                    .agg(
+                        Oil_Total_bbl=('Monthly Oil (bbl)', 'sum'),
+                        Oil_Avg_bopd=('Oil (bopd)', 'mean'),
+                        Gas_Total_mmscf=('Monthly Gas (MMscf)', 'sum'),
+                        Gas_Avg_mmscfpd=('Gas (MMscfd)', 'mean'),
+                        Condensate_Total_bbl=('Monthly Condensate (bbl)', 'sum'),
+                        Condensate_Avg_bbl=('Monthly Condensate (bbl)', 'mean'),
+                        Water_Total_bbl=('Monthly Water (bbl)', 'sum'),
+                        Water_Avg_bwpd=('Water (bwpd)', 'mean'),
+                        PRODDAYS_sum=('PRODDAYS', 'sum')
+                    ).reset_index())
+
+    monthly_field = (wf.groupby(['Month', 'Field'])
+                    .agg(
+                        Oil_Total_bbl=('Monthly Oil (bbl)', 'sum'),
+                        Oil_Avg_bopd=('Oil (bopd)', 'mean'),
+                        Gas_Total_mmscf=('Monthly Gas (MMscf)', 'sum'),
+                        Condensate_Total_bbl=('Monthly Condensate (bbl)', 'sum'),
+                        Water_Total_bbl=('Monthly Water (bbl)', 'sum'),
+                        PRODDAYS_sum=('PRODDAYS', 'sum')
+                    ).reset_index())
+
+    # Yearly totals by well (sum of monthly volumes for months in the year)
+    yearly_totals_well = (
+        wf
+        .groupby(['Year', 'Well Name'])
+        .agg(
+            Oil_Total_bbl=('Monthly Oil (bbl)', 'sum'),
+            Gas_Total_mmscf=('Monthly Gas (MMscf)', 'sum'),
+            Condensate_Total_bbl=('Monthly Condensate (bbl)', 'sum'),
+            Water_Total_bbl=('Monthly Water (bbl)', 'sum'),
+            PRODDAYS_sum=('PRODDAYS', 'sum')  # keep for reference if needed
+        )
+        .reset_index()
+    )
+
+    # Yearly weighted average daily rates by well (weight by PRODDAYS so months with more production days dominate)
+    yearly_avg_well = (
+        wf
+        .groupby(['Year', 'Well Name'])
+        .apply(lambda g: pd.Series({
+            'Oil_Avg_bopd_weighted': weighted_avg(g['Oil (bopd)'], g['PRODDAYS']),
+            'Gas_Avg_mmscfpd_weighted': weighted_avg(g['Gas (MMscfd)'], g['PRODDAYS']),
+            'Condensate_Avg_bblpd_weighted': weighted_avg(g['Condensate (bbl/d) (from NAG)'], g['PRODDAYS']),
+            'Water_Avg_bwpd_weighted': weighted_avg(g['Water (bwpd)'], g['PRODDAYS'])
+        }))
+        .reset_index()
+    )
+
+    # Merge totals and averages into the final yearly_well table
+    yearly_well = yearly_totals_well.merge(yearly_avg_well, on=['Year', 'Well Name'], how='left')
+
+    # Yearly totals by field (sum of monthly volumes)
+    yearly_totals_field = (
+        wf
+        .groupby(['Year', 'Field'])
+        .agg(
+            Oil_Total_bbl=('Monthly Oil (bbl)', 'sum'),
+            Gas_Total_mmscf=('Monthly Gas (MMscf)', 'sum'),
+            Condensate_Total_bbl=('Monthly Condensate (bbl)', 'sum'),
+            Water_Total_bbl=('Monthly Water (bbl)', 'sum'),
+            PRODDAYS_sum=('PRODDAYS', 'sum')
+        )
+        .reset_index()
+    )
+
+    # Yearly weighted average daily rates by field
+    yearly_avg_field = (
+        wf
+        .groupby(['Year', 'Field'])
+        .apply(lambda g: pd.Series({
+            'Oil_Avg_bopd_weighted': weighted_avg(g['Oil (bopd)'], g['PRODDAYS']),
+            'Gas_Avg_mmscfpd_weighted': weighted_avg(g['Gas (MMscfd)'], g['PRODDAYS']),
+            'Condensate_Avg_bblpd_weighted': weighted_avg(g['Condensate (bbl/d) (from NAG)'], g['PRODDAYS']),
+            'Water_Avg_bwpd_weighted': weighted_avg(g['Water (bwpd)'], g['PRODDAYS'])
+        }))
+        .reset_index()
+    )
+
+    yearly_field = yearly_totals_field.merge(yearly_avg_field, on=['Year', 'Field'], how='left')
+    
+    monthly_tag = (wf.groupby(['Month', 'Tag'])
+                   .agg(
+                       Oil_Total_bbl=('Monthly Oil (bbl)', 'sum'),
+                       Gas_Total_mmscf=('Monthly Gas (MMscf)', 'sum'),
+                       Condensate_Total_bbl=('Monthly Condensate (bbl)', 'sum'),
+                       Water_Total_bbl=('Monthly Water (bbl)', 'sum')
+                   ).reset_index())
+
+    yearly_tag = (wf.groupby(['Year', 'Tag'])
+                  .agg(
+                      Oil_Total_bbl=('Monthly Oil (bbl)', 'sum'),
+                      Gas_Total_mmscf=('Monthly Gas (MMscf)', 'sum'),
+                      Condensate_Total_bbl=('Monthly Condensate (bbl)', 'sum'),
+                      Water_Total_bbl=('Monthly Water (bbl)', 'sum')
+                  ).reset_index())
+
+    monthly_flow = (wf.groupby(['Month', 'Flowstation'])
+                    .agg(
+                        Oil_Total_bbl=('Monthly Oil (bbl)', 'sum'),
+                        Gas_Total_mmscf=('Monthly Gas (MMscf)', 'sum'),
+                        Condensate_Total_bbl=('Monthly Condensate (bbl)', 'sum'),
+                        Water_Total_bbl=('Monthly Water (bbl)', 'sum')
+                    ).reset_index())
+
+    yearly_flow = (wf.groupby(['Year', 'Flowstation'])
+                   .agg(
+                       Oil_Total_bbl=('Monthly Oil (bbl)', 'sum'),
+                       Gas_Total_mmscf=('Monthly Gas (MMscf)', 'sum'),
+                       Condensate_Total_bbl=('Monthly Condensate (bbl)', 'sum'),
+                       Water_Total_bbl=('Monthly Water (bbl)', 'sum')
+                   ).reset_index())
+
+    # pivots by well for plotting & pies
+    pivot_oil_by_well = wf.pivot_table(index='Month', columns='Well Name', values='Monthly Oil (bbl)', aggfunc='sum').fillna(0)
+    pivot_gas_by_well = wf.pivot_table(index='Month', columns='Well Name', values='Monthly Gas (MMscf)', aggfunc='sum').fillna(0)
+    pivot_cond_by_well = wf.pivot_table(index='Month', columns='Well Name', values='Monthly Condensate (bbl)', aggfunc='sum').fillna(0)
+    pivot_water_by_well = wf.pivot_table(index='Month', columns='Well Name', values='Monthly Water (bbl)', aggfunc='sum').fillna(0)
+
+    pivot_oil_year = wf.pivot_table(index='Year', columns='Well Name', values='Monthly Oil (bbl)', aggfunc='sum').fillna(0)
+    pivot_gas_year = wf.pivot_table(index='Year', columns='Well Name', values='Monthly Gas (MMscf)', aggfunc='sum').fillna(0)
+    pivot_cond_year = wf.pivot_table(index='Year', columns='Well Name', values='Monthly Condensate (bbl)', aggfunc='sum').fillna(0)
+    pivot_water_year = wf.pivot_table(index='Year', columns='Well Name', values='Monthly Water (bbl)', aggfunc='sum').fillna(0)
+
+    # tag/flow pivots for each fluid
+    monthly_tag_pivot_oil = pivot_report(monthly_tag, 'Month', 'Tag', 'Oil_Total_bbl')
+    monthly_tag_pivot_gas = pivot_report(monthly_tag, 'Month', 'Tag', 'Gas_Total_mmscf')
+    monthly_tag_pivot_cond = pivot_report(monthly_tag, 'Month', 'Tag', 'Condensate_Total_bbl')
+    monthly_tag_pivot_water = pivot_report(monthly_tag, 'Month', 'Tag', 'Water_Total_bbl')
+
+    yearly_tag_pivot_oil = pivot_report(yearly_tag, 'Year', 'Tag', 'Oil_Total_bbl')
+    yearly_tag_pivot_gas = pivot_report(yearly_tag, 'Year', 'Tag', 'Gas_Total_mmscf')
+    yearly_tag_pivot_cond = pivot_report(yearly_tag, 'Year', 'Tag', 'Condensate_Total_bbl')
+    yearly_tag_pivot_water = pivot_report(yearly_tag, 'Year', 'Tag', 'Water_Total_bbl')
+
+    monthly_flow_pivot_oil = pivot_report(monthly_flow, 'Month', 'Flowstation', 'Oil_Total_bbl')
+    monthly_flow_pivot_gas = pivot_report(monthly_flow, 'Month', 'Flowstation', 'Gas_Total_mmscf')
+    monthly_flow_pivot_cond = pivot_report(monthly_flow, 'Month', 'Flowstation', 'Condensate_Total_bbl')
+    monthly_flow_pivot_water = pivot_report(monthly_flow, 'Month', 'Flowstation', 'Water_Total_bbl')
+
+    yearly_flow_pivot_oil = pivot_report(yearly_flow, 'Year', 'Flowstation', 'Oil_Total_bbl')
+    yearly_flow_pivot_gas = pivot_report(yearly_flow, 'Year', 'Flowstation', 'Gas_Total_mmscf')
+    yearly_flow_pivot_cond = pivot_report(yearly_flow, 'Year', 'Flowstation', 'Condensate_Total_bbl')
+    yearly_flow_pivot_water = pivot_report(yearly_flow, 'Year', 'Flowstation', 'Water_Total_bbl')
+
+    # yearly field weighted avg (PRODDAYS-weighted daily oil)
+    rows_yfa = []
+    for (yr, fld), g in wf.groupby(['Year', 'Field']):
+        total_oil = g['Monthly Oil (bbl)'].sum()
+        avg_oil_bopd = weighted_avg(g['Oil (bopd)'], g['PRODDAYS'])
+        rows_yfa.append({'Year': yr, 'Field': fld, 'Total_Oil_bbl': total_oil, 'Avg_Oil_bopd_weighted': avg_oil_bopd})
+    yearly_field_avg = pd.DataFrame(rows_yfa)
+
+    outputs = {
+        'well_forecast': wf,
+        'monthly_well': monthly_well,
+        'monthly_field': monthly_field,
+        'yearly_well': yearly_well,
+        'yearly_field': yearly_field,
+        'monthly_tag': monthly_tag,
+        'yearly_tag': yearly_tag,
+        'monthly_flow': monthly_flow,
+        'yearly_flow': yearly_flow,
+        'monthly_tag_pivot_oil': monthly_tag_pivot_oil,
+        'monthly_tag_pivot_gas': monthly_tag_pivot_gas,
+        'monthly_tag_pivot_cond': monthly_tag_pivot_cond,
+        'monthly_tag_pivot_water': monthly_tag_pivot_water,
+        'yearly_tag_pivot_oil': yearly_tag_pivot_oil,
+        'yearly_tag_pivot_gas': yearly_tag_pivot_gas,
+        'yearly_tag_pivot_cond': yearly_tag_pivot_cond,
+        'yearly_tag_pivot_water': yearly_tag_pivot_water,
+        'monthly_flow_pivot_oil': monthly_flow_pivot_oil,
+        'monthly_flow_pivot_gas': monthly_flow_pivot_gas,
+        'monthly_flow_pivot_cond': monthly_flow_pivot_cond,
+        'monthly_flow_pivot_water': monthly_flow_pivot_water,
+        'yearly_flow_pivot_oil': yearly_flow_pivot_oil,
+        'yearly_flow_pivot_gas': yearly_flow_pivot_gas,
+        'yearly_flow_pivot_cond': yearly_flow_pivot_cond,
+        'yearly_flow_pivot_water': yearly_flow_pivot_water,
+        'pivot_oil_by_well': pivot_oil_by_well,
+        'pivot_gas_by_well': pivot_gas_by_well,
+        'pivot_cond_by_well': pivot_cond_by_well,
+        'pivot_water_by_well': pivot_water_by_well,
+        'pivot_oil_year': pivot_oil_year,
+        'pivot_gas_year': pivot_gas_year,
+        'pivot_cond_year': pivot_cond_year,
+        'pivot_water_year': pivot_water_year,
+        'yearly_field_avg': yearly_field_avg
+    }
+    return outputs
+
+# ---------------- UI: Upload & Params ----------------
+uploaded = st.file_uploader("Upload Excel file (rows = wells; include Forecast_Start_Test)", type=["xlsx","xls"], accept_multiple_files=False)
+col1, col2, col3 = st.columns(3)
+with col1:
+    start_year = st.number_input("Start year", value=2025, step=1, min_value=1900, max_value=2100)
+with col2:
+    end_year = st.number_input("End year", value=2030, step=1, min_value=1900, max_value=2100)
+with col3:
+    default_decline = st.number_input("Default decline rate (%/yr)", value=5.0, step=0.1)
+
+# Always define 'results' so we don't get NameError later
+results = {'well_forecast': pd.DataFrame()}
+
+if uploaded is None:
+    st.info("Upload your Excel file (must contain 'Well Name' and 'Forecast_Start_Test' columns).")
+    st.stop()
+
+try:
+    input_df = pd.read_excel(uploaded)
+except Exception as e:
+    st.error(f"Error reading uploaded file: {e}")
+    st.stop()
+
+# Generate forecasts (catch and display errors)
+try:
+    results = generate_forecasts(input_df, start_year=start_year, end_year=end_year, default_decline_rate=default_decline)
+except Exception as e:
+    st.error(f"Error generating forecasts: {e}")
+    # ensure results remains defined so UI doesn't break
+    results = {'well_forecast': pd.DataFrame()}
+    st.stop()
+
+# Defensive check
+if not isinstance(results, dict) or 'well_forecast' not in results:
+    st.error("generate_forecasts returned unexpected output. Expected dict with 'well_forecast'.")
+    st.stop()
+
+# Save to session_state for downloads if desired
+st.session_state['results'] = results
+
+# ---------------- Tabs ----------------
+tabs = st.tabs(["Forecast Table", "Monthly Summaries & Plot", "Yearly Summaries", "Tag & Flowstation Pivots", "Field Yearly Averages", "Export (Excel)"])
+
+# --- Tab 0: Forecast table ---
+with tabs[0]:
+    st.header("Detailed Well Forecast (monthly rows)")
+    wf = results.get('well_forecast', pd.DataFrame())
+    if wf.empty:
+        st.write("No forecast rows computed.")
+    else:
+        st.dataframe(wf.head(1000), use_container_width=True)
+        st.download_button("Download full forecast (CSV)", wf.to_csv(index=False).encode('utf-8'), file_name="well_forecast.csv", mime="text/csv")
+
+# --- Tab 1: Monthly Summaries & Stacked Plot ---
+with tabs[1]:
+    st.header("Monthly Summaries & Stacked Plot (select fluid)")
+    monthly_well = results.get('monthly_well', pd.DataFrame())
+    if not monthly_well.empty:
+        st.subheader("Monthly summary by Well (totals & averages)")
+        st.dataframe(monthly_well.head(500), use_container_width=True)
+        st.download_button("Download Monthly Well Summary (CSV)", monthly_well.to_csv(index=False).encode('utf-8'), file_name="monthly_well_summary.csv")
+
+    fluid = st.selectbox("Select fluid to plot", ["Oil", "Gas", "Condensate", "Water"])
+    pivot_map = {
+        'Oil': results.get('pivot_oil_by_well', pd.DataFrame()),
+        'Gas': results.get('pivot_gas_by_well', pd.DataFrame()),
+        'Condensate': results.get('pivot_cond_by_well', pd.DataFrame()),
+        'Water': results.get('pivot_water_by_well', pd.DataFrame())
+    }
+    pivot = pivot_map.get(fluid, pd.DataFrame())
+    if pivot is None or pivot.empty:
+        st.warning(f"No pivot data for {fluid}.")
+    else:
+        piv_plot = pivot.copy().reset_index()
+        if 'Month' not in piv_plot.columns:
+            piv_plot = piv_plot.rename(columns={piv_plot.columns[0]: 'Month'})
+        months = piv_plot['Month'].astype(str).tolist()
+        wells = [c for c in piv_plot.columns if c != 'Month']
+        selected = st.multiselect("Wells to include (empty -> top 10 by total)", wells, default=None)
+        if not selected:
+            totals = piv_plot[wells].sum(axis=0).sort_values(ascending=False)
+            selected = totals.index[:10].tolist()
+        plot_df = piv_plot[['Month'] + selected].copy()
+        fig = go.Figure()
+        for w in selected:
+            fig.add_trace(go.Bar(x=plot_df['Month'], y=plot_df[w], name=w))
+        totals = plot_df[selected].sum(axis=1)
+        cum_total = totals.cumsum()
+        fig.add_trace(go.Scatter(x=plot_df['Month'], y=cum_total, mode='lines+markers', name='Cumulative', yaxis='y2'))
+        fig.update_layout(
+            title=f"Monthly {fluid} Production by Well (stacked) with Cumulative",
+            xaxis=dict(title='Month'),
+            yaxis=dict(title=f'{fluid} monthly total'),
+            yaxis2=dict(title='Cumulative', overlaying='y', side='right', showgrid=False),
+            barmode='stack',
+            height=600
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        st.download_button(f"Download {fluid} plotted data (CSV)", plot_df.to_csv(index=False).encode('utf-8'), file_name=f"{fluid}_monthly_stacked.csv")
+
+# --- Tab 2: Yearly Summaries & Pie charts ---
+with tabs[2]:
+    st.header("Yearly Summaries & Well Contribution Pie Charts (select fluid & year)")
+    yearly_well = results.get('yearly_well', pd.DataFrame())
+    yearly_field = results.get('yearly_field', pd.DataFrame())
+
+    left, right = st.columns(2)
+    with left:
+        if yearly_well.empty:
+            st.write("No yearly well summary available.")
+        else:
+            st.subheader("Yearly summary by Well (table)")
+            st.dataframe(yearly_well.head(500), use_container_width=True)
+            st.download_button("Download Yearly Well Summary (CSV)", data=yearly_well.to_csv(index=False).encode('utf-8'), file_name="yearly_well_summary.csv")
+    with right:
+        if yearly_field.empty:
+            st.write("No yearly field summary available.")
+        else:
+            st.subheader("Yearly summary by Field (table)")
+            st.dataframe(yearly_field.head(500), use_container_width=True)
+            st.download_button("Download Yearly Field Summary (CSV)", data=yearly_field.to_csv(index=False).encode('utf-8'), file_name="yearly_field_summary.csv")
+
+    st.markdown("---")
+    st.subheader("Pie chart: Contribution of each WELL to yearly total (choose fluid & year)")
+    pivot_year_map = {
+        'Oil': results.get('pivot_oil_year', pd.DataFrame()),
+        'Gas': results.get('pivot_gas_year', pd.DataFrame()),
+        'Condensate': results.get('pivot_cond_year', pd.DataFrame()),
+        'Water': results.get('pivot_water_year', pd.DataFrame())
+    }
+    fluid_pie = st.selectbox("Fluid for pie", ["Oil", "Gas", "Condensate", "Water"], index=0)
+    pivot_choice = pivot_year_map.get(fluid_pie, pd.DataFrame())
+    years = sorted(yearly_well['Year'].unique().tolist()) if not yearly_well.empty else []
+    if not years:
+        st.info("No yearly data available for pie charts.")
+    else:
+        sel_year = st.selectbox("Select year", years, index=0)
+        top_n = st.number_input("Top N wells to show (others grouped)", value=10, min_value=3, max_value=200, step=1)
+        show_all = st.checkbox("Show small multiples for all years", value=False)
+        if pivot_choice.empty or sel_year not in pivot_choice.index:
+            st.warning(f"No data for {fluid_pie} in {sel_year}")
+        else:
+            if not show_all:
+                series = pivot_choice.loc[sel_year]
+                series = series[series > 0].sort_values(ascending=False)
+                if len(series) > top_n:
+                    top = series.iloc[:top_n]
+                    other_sum = series.iloc[top_n:].sum()
+                    labels = top.index.tolist() + ['Other']
+                    values = top.values.tolist() + [other_sum]
+                else:
+                    labels = series.index.tolist()
+                    values = series.values.tolist()
+                fig = go.Figure(data=[go.Pie(labels=labels, values=values, hole=0.25, textinfo='label+percent')])
+                fig.update_layout(title_text=f"{fluid_pie} contribution by well in {sel_year}", height=450)
+                st.plotly_chart(fig, use_container_width=True)
+                df_pct = pd.DataFrame({'Well': labels, 'Total': values})
+                df_pct['Pct (%)'] = 100 * df_pct['Total'] / df_pct['Total'].sum()
+                st.dataframe(df_pct.sort_values('Pct (%)', ascending=False).reset_index(drop=True))
+                st.download_button("Download pie data (CSV)", df_pct.to_csv(index=False).encode('utf-8'), file_name=f"pie_{fluid_pie}_{sel_year}.csv")
+            else:
+                yrs = years
+                n = len(yrs)
+                cols = 3
+                rows = (n + cols - 1) // cols
+                specs = []
+                for _ in range(rows):
+                    specs.append([{'type':'domain'}]*cols)
+                fig_multi = make_subplots(rows=rows, cols=cols, specs=specs, subplot_titles=[str(y) for y in yrs])
+                r = 1; c = 1
+                for idx, y in enumerate(yrs):
+                    if y not in pivot_choice.index:
+                        labels = ['No data']; values = [1]
+                    else:
+                        s = pivot_choice.loc[y].sort_values(ascending=False)
+                        if len(s) > top_n:
+                            top = s.iloc[:top_n]
+                            other_sum = s.iloc[top_n:].sum()
+                            labels = top.index.astype(str).tolist() + ['Other']
+                            values = top.tolist() + [other_sum]
+                        else:
+                            labels = s.index.astype(str).tolist()
+                            values = s.tolist()
+                    fig_multi.add_trace(go.Pie(labels=labels, values=values, textinfo='percent', showlegend=False), row=r, col=c)
+                    c += 1
+                    if c > cols:
+                        c = 1
+                        r += 1
+                fig_multi.update_layout(height=300*rows, title_text=f"{fluid_pie} contribution — small multiples")
+                st.plotly_chart(fig_multi, use_container_width=True)
+
+# --- Tab 3: Tag & Flowstation Pivots (all fluids) ---
+with tabs[3]:
+    st.header("Tag & Flowstation Pivots (choose fluid)")
+    fluid_tag = st.selectbox("Choose fluid for Tag & Flowstation pivots", ["Oil", "Gas", "Condensate", "Water"], index=0)
+    if fluid_tag == 'Oil':
+        mt_piv = results.get('monthly_tag_pivot_oil', pd.DataFrame())
+        mf_piv = results.get('monthly_flow_pivot_oil', pd.DataFrame())
+        yt_piv = results.get('yearly_tag_pivot_oil', pd.DataFrame())
+        yf_piv = results.get('yearly_flow_pivot_oil', pd.DataFrame())
+    elif fluid_tag == 'Gas':
+        mt_piv = results.get('monthly_tag_pivot_gas', pd.DataFrame())
+        mf_piv = results.get('monthly_flow_pivot_gas', pd.DataFrame())
+        yt_piv = results.get('yearly_tag_pivot_gas', pd.DataFrame())
+        yf_piv = results.get('yearly_flow_pivot_gas', pd.DataFrame())
+    elif fluid_tag == 'Condensate':
+        mt_piv = results.get('monthly_tag_pivot_cond', pd.DataFrame())
+        mf_piv = results.get('monthly_flow_pivot_cond', pd.DataFrame())
+        yt_piv = results.get('yearly_tag_pivot_cond', pd.DataFrame())
+        yf_piv = results.get('yearly_flow_pivot_cond', pd.DataFrame())
+    else:
+        mt_piv = results.get('monthly_tag_pivot_water', pd.DataFrame())
+        mf_piv = results.get('monthly_flow_pivot_water', pd.DataFrame())
+        yt_piv = results.get('yearly_tag_pivot_water', pd.DataFrame())
+        yf_piv = results.get('yearly_flow_pivot_water', pd.DataFrame())
+
+    st.subheader(f"Monthly pivot - {fluid_tag} by Tag")
+    if mt_piv.empty:
+        st.write("No monthly tag pivot available for selected fluid.")
+    else:
+        st.dataframe(mt_piv, use_container_width=True)
+        st.download_button(f"Download Monthly Tag Pivot ({fluid_tag})", mt_piv.to_csv(index=False).encode('utf-8'), file_name=f'monthly_tag_pivot_{fluid_tag}.csv')
+
+    st.subheader(f"Monthly pivot - {fluid_tag} by Flowstation")
+    if mf_piv.empty:
+        st.write("No monthly flowstation pivot available for selected fluid.")
+    else:
+        st.dataframe(mf_piv, use_container_width=True)
+        st.download_button(f"Download Monthly Flowstation Pivot ({fluid_tag})", mf_piv.to_csv(index=False).encode('utf-8'), file_name=f'monthly_flow_pivot_{fluid_tag}.csv')
+
+    st.markdown("---")
+    st.subheader(f"Yearly pivot - {fluid_tag} by Tag")
+    if yt_piv.empty:
+        st.write("No yearly tag pivot available for selected fluid.")
+    else:
+        st.dataframe(yt_piv, use_container_width=True)
+        st.download_button(f"Download Yearly Tag Pivot ({fluid_tag})", yt_piv.to_csv(index=False).encode('utf-8'), file_name=f'yearly_tag_pivot_{fluid_tag}.csv')
+
+    st.subheader(f"Yearly pivot - {fluid_tag} by Flowstation")
+    if yf_piv.empty:
+        st.write("No yearly flowstation pivot available for selected fluid.")
+    else:
+        st.dataframe(yf_piv, use_container_width=True)
+        st.download_button(f"Download Yearly Flowstation Pivot ({fluid_tag})", yf_piv.to_csv(index=False).encode('utf-8'), file_name=f'yearly_flow_pivot_{fluid_tag}.csv')
+
+# --- Tab 4: Field Yearly Averages & Totals (multi-fluid) ---
+with tabs[4]:
+    st.header("Field Yearly Averages & Totals (choose fluid)")
+    yfa = results.get('yearly_field_avg', pd.DataFrame())
+    if yfa.empty:
+        st.write("No yearly field weighted averages (oil) computed.")
+    else:
+        st.subheader("Weighted Avg Daily Oil Rate (bopd) per Field by Year")
+        st.dataframe(yfa, use_container_width=True)
+        st.download_button("Download Yearly Field Averages (CSV)", data=yfa.to_csv(index=False).encode('utf-8'), file_name='yearly_field_averages.csv')
+
+    st.markdown("---")
+    st.subheader("Total production by Field by Year (grouped bars) — choose fluid")
+    yearly_field = results.get('yearly_field', pd.DataFrame())
+    if yearly_field.empty:
+        st.write("No yearly field totals.")
+    else:
+        fluid_tot = st.selectbox("Fluid to show totals for (per field)", ["Oil", "Gas", "Condensate", "Water"], index=0)
+        col_map = {
+            'Oil': 'Oil_Total_bbl',
+            'Gas': 'Gas_Total_mmscf',
+            'Condensate': 'Condensate_Total_bbl',
+            'Water': 'Water_Total_bbl'
+        }
+        val_col = col_map[fluid_tot]
+        pivot_tf = yearly_field.pivot(index='Year', columns='Field', values=val_col).fillna(0).reset_index()
+        if pivot_tf.empty:
+            st.write("Pivot empty for chosen fluid.")
+        else:
+            st.dataframe(pivot_tf, use_container_width=True)
+            yrs = pivot_tf['Year'].astype(str).tolist()
+            fig2 = go.Figure()
+            for fld in [c for c in pivot_tf.columns if c != 'Year']:
+                fig2.add_trace(go.Bar(x=yrs, y=pivot_tf[fld], name=fld))
+            fig2.update_layout(title=f"Total {fluid_tot} per Field by Year", barmode='group', xaxis_title='Year', yaxis_title=f"Total {fluid_tot}")
+            st.plotly_chart(fig2, use_container_width=True)
+            st.download_button(f"Download Yearly Field Totals ({fluid_tot})", pivot_tf.to_csv(index=False).encode('utf-8'), file_name=f'yearly_field_totals_{fluid_tot}.csv')
+
+# --- Tab 5: Export multi-sheet Excel report ---
+with tabs[5]:
+    st.header("Export all reports to a multi-sheet Excel file")
+    if st.button("Generate Excel Report"):
+        out = io.BytesIO()
+        with pd.ExcelWriter(out, engine='xlsxwriter') as writer:
+            for name, df in results.items():
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    sheet_name = str(name)[:31]
+                    try:
+                        df.to_excel(writer, sheet_name=sheet_name, index=False)
+                    except Exception as e:
+                        st.warning(f"Could not write sheet {sheet_name}: {e}")
+            writer.save()
+            out.seek(0)
+        st.download_button("Download Excel report", data=out, file_name=f"production_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+st.markdown("---")
+st.caption("Notes: GOR (G0R) expected in scf/bbl (converted to MMscf/bbl). Gas Rate column treated as NAG in MMscfd. CGR assumed bbl/MMscf so condensate = CGR * NAG. If your file uses other units or column names, adjust the columns or tell me the exact column names/units and I will adapt the script.")
